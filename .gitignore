@@ -11,3 +11,8 @@ dist
 .automaton/wallet.json
 .automaton/state.db
 
+# Fork: local session/handoff notes and runtime artifacts (not for publishing)
+SESSION-CONTEXT.md
+portfolio.json
+.automaton/
+

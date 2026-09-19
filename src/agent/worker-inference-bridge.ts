@@ -2,6 +2,7 @@ import type { UnifiedInferenceClient } from "../inference/inference-client.js";
 import type { ModelTier } from "../inference/provider-registry.js";
 import type { InferenceToolCall } from "../types.js";
 import type { WorkerInferenceClient } from "./harness-types.js";
+import { chargeSimTokens } from "../sim/inference-billing.js";
 
 export function createWorkerInferenceBridge(
   inference: Pick<UnifiedInferenceClient, "chat">,
@@ -17,6 +18,16 @@ export function createWorkerInferenceBridge(
         temperature: params.temperature,
         responseFormat: normalizeResponseFormat(params.responseFormat),
       });
+
+      // Simulation mode: worker inference bypasses the main billing
+      // wrapper, so charge the fake ledger here.
+      if (process.env.AUTOMATON_SIM_MODE === "1" && response.usage) {
+        chargeSimTokens(
+          response.usage.inputTokens,
+          response.usage.outputTokens,
+          "worker-inference",
+        );
+      }
 
       return {
         content: response.content,

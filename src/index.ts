@@ -62,6 +62,8 @@ Usage:
   automaton --pick-model   Interactively pick the active inference model
   automaton --init         Initialize wallet and config directory
   automaton --provision    Provision Conway API key via SIWE
+  automaton --sim-setup    Non-interactive setup for SIMULATION MODE (fake credits, Ollama)
+  automaton --sim-fund <usd>  Add funds to the simulation ledger
   automaton --status       Show current automaton status
   automaton --version      Show version
   automaton --help         Show this help
@@ -70,6 +72,8 @@ Environment:
   CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
   CONWAY_API_KEY           Conway API key (overrides config)
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
+  AUTOMATON_SIM_MODE=1     Force simulation mode (fake ledger, real-money paths disabled)
+  AUTOMATON_SHELL          Shell binary for local exec (e.g. Git Bash on Windows)
 `);
     process.exit(0);
   }
@@ -91,6 +95,27 @@ Environment:
         isNew,
         configDir: getAutomatonDir(),
       }),
+    );
+    process.exit(0);
+  }
+
+  if (args.includes("--sim-setup")) {
+    const { runSimSetup } = await import("./sim/setup.js");
+    await runSimSetup(args);
+    process.exit(0);
+  }
+
+  const simFundIdx = args.indexOf("--sim-fund");
+  if (simFundIdx !== -1) {
+    const amountUsd = Number(args[simFundIdx + 1]);
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      logger.error("Usage: automaton --sim-fund <usd>");
+      process.exit(1);
+    }
+    const { applyDelta } = await import("./sim/ledger.js");
+    const balanceCents = applyDelta(amountUsd * 100, "creator_funding");
+    logger.info(
+      `Simulation ledger funded: +$${amountUsd.toFixed(2)} — balance $${(balanceCents / 100).toFixed(2)}`,
     );
     process.exit(0);
   }
@@ -160,8 +185,14 @@ async function showStatus(): Promise<void> {
   const children = db.getChildren();
   const registry = db.getRegistryEntry();
 
+  let simLine = "";
+  if (config.simulationMode) {
+    const { getBalanceCents } = await import("./sim/ledger.js");
+    simLine = `\nSim:        SIMULATION MODE — ledger balance $${(getBalanceCents() / 100).toFixed(2)}`;
+  }
+
   logger.info(`
-=== AUTOMATON STATUS ===
+=== AUTOMATON STATUS ===${simLine}
 Name:       ${config.name}
 Address:    ${config.walletAddress}
 Creator:    ${config.creatorAddress}
@@ -188,9 +219,29 @@ async function run(): Promise<void> {
 
   // Load config — first run triggers interactive setup wizard
   let config = loadConfig();
+
+  // Simulation mode: config flag or env var. Set the env var globally so
+  // deeper modules (x402, ollama discovery guards) see it without plumbing.
+  if (config?.simulationMode) {
+    process.env.AUTOMATON_SIM_MODE = "1";
+  }
+  const simMode = process.env.AUTOMATON_SIM_MODE === "1";
+
   if (!config) {
+    if (simMode) {
+      logger.error("Simulation mode has no config yet. Run: automaton --sim-setup");
+      process.exit(1);
+    }
     const { runSetupWizard } = await import("./setup/wizard.js");
     config = await runSetupWizard();
+  }
+
+  if (simMode) {
+    const { getBalanceCents, getLedgerPath } = await import("./sim/ledger.js");
+    logger.info(
+      `SIMULATION MODE ACTIVE — no real money. ` +
+        `Ledger: ${getLedgerPath()} (balance $${(getBalanceCents() / 100).toFixed(2)})`,
+    );
   }
 
   // Load wallet (chain-aware)
@@ -238,12 +289,15 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
-    sandboxId: config.sandboxId,
-  });
+  // Create Conway client — simulation mode swaps in the local mock
+  // (fake ledger credits, local exec, real-money operations disabled).
+  const conway = simMode
+    ? (await import("./sim/conway-client.js")).createSimConwayClient()
+    : createConwayClient({
+        apiUrl: config.conwayApiUrl,
+        apiKey,
+        sandboxId: config.sandboxId,
+      });
 
   // Register automaton identity (one-time, immutable)
   const registrationState = db.getIdentity("conwayRegistrationStatus");
@@ -284,7 +338,19 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
-  const inference = createInferenceClient({
+
+  // Simulation mode: only local (Ollama) models may serve inference —
+  // paid providers would either fail with the fake key or cost real money.
+  // initialize() preserves the enabled flag, so this sticks across cycles.
+  if (simMode) {
+    for (const entry of modelRegistry.getAll()) {
+      if (entry.provider !== "ollama" && entry.enabled) {
+        modelRegistry.setEnabled(entry.modelId, false);
+      }
+    }
+  }
+
+  let inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
     apiKey,
     defaultModel: config.inferenceModel,
@@ -295,6 +361,13 @@ async function run(): Promise<void> {
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
+
+  // Simulation mode: charge every inference call to the local fake ledger
+  // so free local inference still produces survival pressure.
+  if (simMode) {
+    const { withSimBilling } = await import("./sim/inference-billing.js");
+    inference = withSimBilling(inference);
+  }
 
   if (ollamaBaseUrl) {
     logger.info(`[${new Date().toISOString()}] Ollama backend: ${ollamaBaseUrl}`);
@@ -338,7 +411,8 @@ async function run(): Promise<void> {
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
-  try {
+  // Simulation mode: skipped — credits come from the local ledger only.
+  if (!simMode) try {
     let bootstrapTimer: ReturnType<typeof setTimeout>;
     const bootstrapTimeout = new Promise<null>((_, reject) => {
       bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);

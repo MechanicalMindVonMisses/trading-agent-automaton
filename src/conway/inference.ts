@@ -16,7 +16,9 @@ import type {
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
 
-const INFERENCE_TIMEOUT_MS = 60_000;
+// Overridable for slow local models (e.g. large Ollama models on limited VRAM).
+const INFERENCE_TIMEOUT_MS =
+  Number(process.env.AUTOMATON_INFERENCE_TIMEOUT_MS) || 60_000;
 
 interface InferenceClientOptions {
   apiUrl: string;

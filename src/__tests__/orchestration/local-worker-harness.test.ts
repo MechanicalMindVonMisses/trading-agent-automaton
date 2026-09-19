@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -294,6 +294,11 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
 
     const originalHome = process.env.HOME;
     process.env.HOME = tempHome;
+    // On Windows os.homedir() ignores $HOME (it reads USERPROFILE), so the
+    // worker would persist plan artifacts to the real home instead of tempHome.
+    // Mock homedir to keep the workspace path inside the isolated temp dir on
+    // every platform (mirrors workspace.test.ts).
+    const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
     try {
       const pool = new LocalWorkerPool({
         db,
@@ -308,6 +313,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       await (pool as any).runWorker("worker-test", task, new AbortController().signal);
     } finally {
       process.env.HOME = originalHome;
+      homedirSpy.mockRestore();
     }
 
     const row = getTaskById(db, task.id);

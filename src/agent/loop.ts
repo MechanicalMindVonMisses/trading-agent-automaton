@@ -65,6 +65,8 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { filterToolsForSim, isSimMode } from "./sim-restrictions.js";
+import { createTradingTools } from "./trading-tools.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -87,6 +89,20 @@ export interface AgentLoopOptions {
 }
 
 /**
+ * Local worker pools are reused across wake cycles within a single process.
+ *
+ * runAgentLoop is re-invoked on every heartbeat wake (see the run loop in
+ * index.ts), but a spawned local worker is an async task that keeps running
+ * after the wake that started it returns. If each wake built a fresh pool, its
+ * activeWorkers map would be empty and the orchestrator's stale-task recovery
+ * would treat still-running workers as dead — resetting their tasks and spawning
+ * duplicate workers every wake (churn). Keying the pool on the per-process db
+ * handle preserves worker-liveness across wakes; a real restart gets a new
+ * process (hence a new db handle) and therefore a fresh, empty pool.
+ */
+const workerPoolByDb = new WeakMap<object, LocalWorkerPool>();
+
+/**
  * Run the agent loop. This is the main execution path.
  * Returns when the agent decides to sleep or when compute runs out.
  */
@@ -98,7 +114,16 @@ export async function runAgentLoop(
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  // Sim solo mode: drop agent-spawning, colony-delegation, domain, on-chain,
+  // and real-money tools so the agent works alone on its own code + investment
+  // (see sim-restrictions.ts). No-op outside sim mode.
+  // Paper-trading tools (fake USD, live CoinGecko prices) exist only in sim.
+  const tradingTools = isSimMode() ? createTradingTools() : [];
+  const tools = filterToolsForSim([
+    ...builtinTools,
+    ...tradingTools,
+    ...installedTools,
+  ]);
   const toolContext: ToolContext = {
     identity,
     config,
@@ -121,6 +146,16 @@ export async function runAgentLoop(
     const { discoverOllamaModels } = await import("../ollama/discover.js");
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
+
+  // Simulation mode: keep paid providers disabled even if a registry
+  // refresh re-added them — only local models may serve inference.
+  if (process.env.AUTOMATON_SIM_MODE === "1") {
+    for (const entry of modelRegistry.getAll()) {
+      if (entry.provider !== "ollama" && entry.enabled) {
+        modelRegistry.setEnabled(entry.modelId, false);
+      }
+    }
+  }
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
   const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker);
 
@@ -129,7 +164,11 @@ export async function runAgentLoop(
   let orchestrator: Orchestrator | undefined;
   let workerPool: LocalWorkerPool | undefined;
 
-  if (hasTable(db.raw, "goals")) {
+  // Sim solo mode runs a single agent with no colony: skip the whole
+  // orchestrator + local-worker-pool bootstrap so no workers are ever spawned
+  // and no delegated task graph is processed. The agent does the work itself
+  // in the ReAct loop below.
+  if (!isSimMode() && hasTable(db.raw, "goals")) {
     try {
       planModeController = new PlanModeController(db.raw);
 
@@ -183,21 +222,34 @@ export async function runAgentLoop(
       // harnesses can preserve tier + responseFormat contracts.
       const workerInference = createWorkerInferenceBridge(unifiedInference);
 
+      // Local workers are in-process and cannot survive a restart: any
+      // local:// child row still marked alive belongs to a previous pool
+      // instance. Mark them dead so the tracker never hands them out.
+      db.raw.prepare(
+        "UPDATE children SET status = 'dead' WHERE address LIKE 'local://%' AND status IN ('running', 'healthy')",
+      ).run();
+
       // Local worker pool: runs inference-driven agents in-process
       // as async tasks. Falls back from Conway sandbox spawning.
-      const initializedWorkerPool = new LocalWorkerPool({
-        db: db.raw,
-        inference: workerInference,
-        conway,
-        harnessRegistry,
-        identity,
-        config,
-        allowedEditRoot: process.cwd(),
-        tools,
-        toolContext,
-        policyEngine,
-        spendTracker,
-      });
+      // Reuse the pool across wakes so in-flight workers stay tracked (see the
+      // workerPoolByDb note above). Only build one on the first wake of a process.
+      let initializedWorkerPool = workerPoolByDb.get(db.raw);
+      if (!initializedWorkerPool) {
+        initializedWorkerPool = new LocalWorkerPool({
+          db: db.raw,
+          inference: workerInference,
+          conway,
+          harnessRegistry,
+          identity,
+          config,
+          allowedEditRoot: process.cwd(),
+          tools,
+          toolContext,
+          policyEngine,
+          spendTracker,
+        });
+        workerPoolByDb.set(db.raw, initializedWorkerPool);
+      }
       workerPool = initializedWorkerPool;
 
       orchestrator = new Orchestrator({

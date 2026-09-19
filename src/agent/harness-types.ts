@@ -89,10 +89,16 @@ export interface AccumulatedWisdom {
 }
 
 export function createBudgetFromTask(task: TaskNode): IterationBudget {
+  const taskTimeoutMs = task.metadata.timeoutMs || 300_000;
+  // Optional global floor (ms) via env. Slow local models (e.g. 14b on limited
+  // VRAM) can exceed the stored per-task budget across multiple turns; this lets
+  // an operator raise the wall-clock budget for every task without editing plans
+  // or the DB. Unset/invalid → 0 → behavior unchanged.
+  const envFloorMs = Number(process.env.AUTOMATON_TASK_TIMEOUT_MS) || 0;
   return {
     maxTurns: 25,
     maxCostCents: Math.max(task.metadata.estimatedCostCents * 2, 50),
-    timeoutMs: task.metadata.timeoutMs || 300_000,
+    timeoutMs: Math.max(taskTimeoutMs, envFloorMs),
     turnsUsed: 0,
     costUsedCents: 0,
     startedAt: 0,

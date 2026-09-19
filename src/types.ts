@@ -75,6 +75,12 @@ export interface AutomatonConfig {
   rpcUrl?: string;
   /** Chain type for this automaton. Defaults to "evm" if absent. */
   chainType?: ChainType;
+  /**
+   * Simulation mode: credits come from a local fake ledger, all
+   * real-money paths (x402, topups, sandboxes, domains) are disabled,
+   * and inference must go to local/BYOK providers. No Conway account needed.
+   */
+  simulationMode?: boolean;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {

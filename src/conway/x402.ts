@@ -196,6 +196,10 @@ export async function getUsdcBalance(
   network: string = "eip155:8453",
   chainType?: ChainType,
 ): Promise<number> {
+  // Simulation mode: no on-chain funds, skip the RPC round-trip entirely.
+  if (process.env.AUTOMATON_SIM_MODE === "1") {
+    return 0;
+  }
   if (chainType === "solana" || network === "solana:mainnet") {
     return getSolanaUsdcBalance(address);
   }
@@ -318,6 +322,15 @@ export async function x402Fetch(
   maxPaymentCents?: number,
   chainType?: ChainType,
 ): Promise<X402PaymentResult> {
+  // Simulation mode: x402 moves real USDC — hard-disable the whole path.
+  if (process.env.AUTOMATON_SIM_MODE === "1") {
+    return {
+      success: false,
+      error:
+        "x402 payments are disabled in simulation mode (no real funds). " +
+        "This will work once the automaton runs with real money.",
+    };
+  }
   // Solana wallets cannot sign EVM x402 payments
   if (chainType === "solana") {
     return {

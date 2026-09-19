@@ -195,7 +195,17 @@ export class Orchestrator {
   async matchTaskToAgent(task: TaskNode): Promise<AgentAssignment> {
     const requestedRole = task.agentRole?.trim() || "generalist";
 
-    const idleAgents = this.params.agentTracker.getIdle();
+    // Local workers are in-process: any local:// child row from a previous
+    // process is dead even if the DB still says "running". Assigning to one
+    // creates an assign→recover loop, so filter them out here.
+    const isAssignable = (address: string): boolean =>
+      !address.startsWith("local://") ||
+      !this.params.isWorkerAlive ||
+      this.params.isWorkerAlive(address);
+
+    const idleAgents = this.params.agentTracker
+      .getIdle()
+      .filter((agent) => isAssignable(agent.address));
     const directRoleMatch = idleAgents.find((agent) => agent.role === requestedRole);
     if (directRoleMatch) {
       return {
@@ -206,7 +216,7 @@ export class Orchestrator {
     }
 
     const bestIdle = this.params.agentTracker.getBestForTask(requestedRole);
-    if (bestIdle) {
+    if (bestIdle && isAssignable(bestIdle.address)) {
       return {
         agentAddress: bestIdle.address,
         agentName: bestIdle.name,

@@ -115,6 +115,9 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
         cwd: process.env.HOME || "/root",
+        // Optional shell override (e.g. Git Bash on Windows) so agent
+        // commands written for POSIX run correctly on non-Linux hosts.
+        shell: process.env.AUTOMATON_SHELL || undefined,
       });
       return { stdout: stdout || "", stderr: "", exitCode: 0 };
     } catch (err: any) {

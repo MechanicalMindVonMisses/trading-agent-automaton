@@ -105,7 +105,10 @@ export class InferenceRouter {
     // 5. Build inference options
     const preference = this.getPreference(tier, taskType);
     const maxTokens = request.maxTokens || preference?.maxTokens || model.maxTokens;
-    const timeout = TASK_TIMEOUTS[taskType] || 120_000;
+    const timeout = Math.max(
+      TASK_TIMEOUTS[taskType] || 120_000,
+      Number(process.env.AUTOMATON_INFERENCE_TIMEOUT_MS) || 0,
+    );
 
     const inferenceOptions: any = {
       model: model.modelId,
