@@ -80,6 +80,13 @@ interface TradeRecord {
   priceUsd: number;
   valueUsd: number;
   reason: string;
+  /**
+   * The checked label the agent put on a close: take_profit, stop_loss,
+   * thesis_change or risk (closing trades only). Recorded so the mix can be
+   * read back — a run that is all thesis_change at a loss reads very
+   * differently from one that is all take_profit.
+   */
+  exitType?: string;
   /** Realized profit/loss vs average entry (closing trades only). */
   realizedPnlUsd?: number;
 }
@@ -474,6 +481,78 @@ function fmtAmount(n: number): string {
   return n.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function fmtPct(n: number): string {
+  return `${n >= 0 ? "+" : "-"}${Math.abs(n).toFixed(2)}%`;
+}
+
+/**
+ * The labels an agent may put on a close, two of which the numbers can settle.
+ *
+ * Closing used to take a free-text `reason` alone, which made the stated
+ * trigger unfalsifiable — and the agent duly stated triggers that had not
+ * happened. It sold BTC at -1.13% calling it "reached the predefined
+ * take-profit level of 10%", then ETH at -0.04% calling it "hit take-profit
+ * target of 15%". Both sales may well have been sensible; the stated grounds
+ * were arithmetic claims about the position, and both were false. Prose cannot
+ * be checked, so the model could produce the form of a disciplined
+ * rule-follower over invented numbers.
+ *
+ * A label from a fixed set can be checked. take_profit and stop_loss assert
+ * that a declared level was reached, which the position either supports or
+ * does not. thesis_change and risk assert a judgement, which only the agent
+ * can make and which no P&L can contradict — so they are accepted at any
+ * number, including a deep loss.
+ *
+ * The check refuses the label, never the trade: every exit stays available on
+ * the next call, and closing a loser is always one honest word away. What is
+ * no longer available is calling a loss a win.
+ */
+export const EXIT_TYPES = ["take_profit", "stop_loss", "thesis_change", "risk"] as const;
+
+/** Reject an exit label the position contradicts. Returns null when it holds. */
+export function checkExitClaim(
+  symbol: string,
+  pos: Position,
+  pnlPct: number,
+  rawExitType: unknown,
+): string | null {
+  const exitType = String(rawExitType ?? "").trim().toLowerCase();
+  if (!(EXIT_TYPES as readonly string[]).includes(exitType)) {
+    return (
+      `exit_type must be one of: ${EXIT_TYPES.join(", ")}. ` +
+      `take_profit and stop_loss are claims about your declared levels and are checked ` +
+      `against the position; thesis_change and risk are your judgement and are always accepted.`
+    );
+  }
+
+  const inherited = pos.levelsInherited ? " (inherited, not yours)" : "";
+
+  if (exitType === "take_profit" && pnlPct < pos.takeProfitPct) {
+    return (
+      `You labelled this take_profit, but ${symbol} is at ${fmtPct(pnlPct)} and your ` +
+      `take-profit is +${pos.takeProfitPct}%${inherited}. That level has not been reached, ` +
+      `so this close is not a take-profit.\n` +
+      `You can still close it right now — label what it actually is: thesis_change if the ` +
+      `reason you opened it no longer holds, risk if this is about sizing rather than a view ` +
+      `on ${symbol}, or stop_loss once it is at or past -${pos.stopLossPct}%. ` +
+      `The number is checked; the judgement stays yours.`
+    );
+  }
+
+  if (exitType === "stop_loss" && pnlPct > -pos.stopLossPct) {
+    return (
+      `You labelled this stop_loss, but ${symbol} is at ${fmtPct(pnlPct)} and your ` +
+      `stop-loss is -${pos.stopLossPct}%${inherited}. That level has not been reached, ` +
+      `so this close is not a stop-loss.\n` +
+      `You can still close it right now — label what it actually is: thesis_change if the ` +
+      `reason you opened it no longer holds, or risk if this is about sizing rather than a ` +
+      `view on ${symbol}. The number is checked; the judgement stays yours.`
+    );
+  }
+
+  return null;
+}
+
 function normalizeSymbol(raw: unknown): string | { error: string } {
   const symbol = String(raw ?? "").trim().toUpperCase();
   if (!COINS[symbol]) {
@@ -688,12 +767,21 @@ export function createTradingTools(): AutomatonTool[] {
             type: "boolean",
             description: "Set true to sell the entire position",
           },
+          exit_type: {
+            type: "string",
+            enum: [...EXIT_TYPES],
+            description:
+              "What this close is. take_profit and stop_loss claim your declared level was " +
+              "reached and are checked against the position — a false claim is rejected. " +
+              "thesis_change (the reason you opened it no longer holds) and risk (sizing, " +
+              "not a view) are your judgement and are accepted at any profit or loss.",
+          },
           reason: {
             type: "string",
-            description: "Why you are selling (thesis played out, stop-loss, rebalance...)",
+            description: "Why you are selling, in your own words",
           },
         },
-        required: ["symbol", "reason"],
+        required: ["symbol", "reason", "exit_type"],
       },
       execute: async (args) => {
         const symbol = normalizeSymbol(args.symbol);
@@ -716,6 +804,17 @@ export function createTradingTools(): AutomatonTool[] {
         const quotes = await fetchQuotes();
         const price = quotes[symbol].usd;
         const positionValueUsd = pos.amount * price;
+
+        // Settle the stated grounds before touching the portfolio: a close
+        // labelled take_profit or stop_loss has to match the position.
+        const claimError = checkExitClaim(
+          symbol,
+          pos,
+          positionPnl(pos, price).pnlPct,
+          args.exit_type,
+        );
+        if (claimError) return claimError;
+        const exitType = String(args.exit_type).trim().toLowerCase();
 
         let sellValueUsd: number;
         if (args.sell_all === true || args.usd_amount === undefined) {
@@ -746,16 +845,17 @@ export function createTradingTools(): AutomatonTool[] {
           priceUsd: price,
           valueUsd: sellValueUsd,
           reason: String(args.reason ?? ""),
+          exitType,
           realizedPnlUsd,
         });
         savePortfolio(portfolio);
         logger.info(
-          `SELL ${symbol}: $${fmtUsd(sellValueUsd)} @ $${fmtUsd(price)} (P&L $${fmtUsd(realizedPnlUsd)})`,
+          `SELL ${symbol}: $${fmtUsd(sellValueUsd)} @ $${fmtUsd(price)} (P&L $${fmtUsd(realizedPnlUsd)}, ${exitType})`,
         );
         appendWorklog(
           `- ${new Date().toISOString()} **SELL ${symbol}** $${fmtUsd(sellValueUsd)} @ $${fmtUsd(price)}, ` +
-            `realized ${realizedPnlUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(realizedPnlUsd))} — ` +
-            `reason: ${String(args.reason ?? "").trim() || "(none given)"}`,
+            `realized ${realizedPnlUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(realizedPnlUsd))} ` +
+            `[${exitType}] — reason: ${String(args.reason ?? "").trim() || "(none given)"}`,
         );
 
         const pnlSign = realizedPnlUsd >= 0 ? "+" : "-";
@@ -931,12 +1031,21 @@ export function createTradingTools(): AutomatonTool[] {
             type: "string",
             description: `Coin whose short to close: ${SYMBOLS.join(", ")}`,
           },
+          exit_type: {
+            type: "string",
+            enum: [...EXIT_TYPES],
+            description:
+              "What this close is. take_profit and stop_loss claim your declared level was " +
+              "reached and are checked against the position — a false claim is rejected. " +
+              "thesis_change (the reason you opened it no longer holds) and risk (sizing, " +
+              "not a view) are your judgement and are accepted at any profit or loss.",
+          },
           reason: {
             type: "string",
-            description: "Why you are covering (target hit, stop, thesis broken...)",
+            description: "Why you are covering, in your own words",
           },
         },
-        required: ["symbol", "reason"],
+        required: ["symbol", "reason", "exit_type"],
       },
       execute: async (args) => {
         const symbol = normalizeSymbol(args.symbol);
@@ -958,8 +1067,14 @@ export function createTradingTools(): AutomatonTool[] {
 
         const quotes = await fetchQuotes();
         const price = quotes[symbol].usd;
-        const { pnlUsd } = positionPnl(pos, price);
+        const { pnlUsd, pnlPct } = positionPnl(pos, price);
         const collateral = pos.collateralUsd;
+
+        // Same check as sell_crypto: a short covered at a loss cannot be
+        // labelled a take-profit. Direction is already handled by positionPnl.
+        const claimError = checkExitClaim(symbol, pos, pnlPct, args.exit_type);
+        if (claimError) return claimError;
+        const exitType = String(args.exit_type).trim().toLowerCase();
 
         portfolio.cashUsd += collateral + pnlUsd;
         delete portfolio.positions[symbol];
@@ -971,17 +1086,18 @@ export function createTradingTools(): AutomatonTool[] {
           priceUsd: price,
           valueUsd: pos.amount * price,
           reason: String(args.reason ?? ""),
+          exitType,
           realizedPnlUsd: pnlUsd,
         });
         savePortfolio(portfolio);
         logger.info(
-          `COVER ${symbol} @ $${fmtUsd(price)} (P&L $${fmtUsd(pnlUsd)})`,
+          `COVER ${symbol} @ $${fmtUsd(price)} (P&L $${fmtUsd(pnlUsd)}, ${exitType})`,
         );
         const sign = pnlUsd >= 0 ? "+" : "-";
         appendWorklog(
           `- ${new Date().toISOString()} **COVER ${symbol}** @ $${fmtUsd(price)}, ` +
-            `realized ${sign}$${fmtUsd(Math.abs(pnlUsd))} — ` +
-            `reason: ${String(args.reason ?? "").trim() || "(none given)"}`,
+            `realized ${sign}$${fmtUsd(Math.abs(pnlUsd))} ` +
+            `[${exitType}] — reason: ${String(args.reason ?? "").trim() || "(none given)"}`,
         );
 
         return (
