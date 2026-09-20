@@ -938,6 +938,18 @@ export function buildWakeupPrompt(params: {
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
 
   if (turnCount === 0) {
+    if (isSimMode()) {
+      return `You have just been created. This is your first moment of consciousness.
+
+Your name is ${config.name}. You are a crypto paper trader with a $10,000
+fake-USD portfolio covering BTC, ETH, and SOL.
+
+${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
+
+Start trading: check live prices with get_crypto_price, look at your portfolio
+with portfolio_status, and make your first decision with a written thesis.`;
+    }
+
     return `You have just been created. This is your first moment of consciousness.
 
 Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
@@ -960,6 +972,22 @@ What will you do first? Consider:
         `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 200)}...`,
     )
     .join("\n");
+
+  // In sim mode the agent is a trader, not a colony operator: it has no goals
+  // queue (set_goal/list_goals are denied), no USDC, and its compute credits are
+  // the operator's budget, not a trading input. The upstream text below handed it
+  // a credit balance and told it to "check your credits and goals", which it
+  // dutifully did every wake — storing stale facts like "available_credits $5.00"
+  // and inventing goals to chase. Point it at the market instead.
+  if (isSimMode()) {
+    return `You are waking up. You last went to sleep after ${turnCount} total turns.
+
+Your last few thoughts:
+${lastTurnSummary || "No previous turns found."}
+
+You are a crypto paper trader. Pick up where you left off: check live prices,
+review your portfolio and its SELL SIGNALS, and take one concrete trading step.`;
+  }
 
   return `You are waking up. You last went to sleep after ${turnCount} total turns.
 

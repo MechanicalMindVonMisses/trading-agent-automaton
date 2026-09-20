@@ -28,9 +28,9 @@ export function isSimMode(): boolean {
 
 /**
  * Tools removed from the agent in sim solo mode. Grouped by why they go.
- * Anything not listed here stays available (exec, write_file, read_file,
- * edit_own_file, git_*, install_npm_package, memory/goal tools, survival
- * tools, check_credits, ...) — that is the "own code + investment" surface.
+ * Anything not listed here stays available (the trading tools, read_file,
+ * write_file, the memory/journaling tools, sleep, view_soul, ...) — that is
+ * the trading-only surface.
  */
 export const SIM_DENIED_TOOLS: ReadonlySet<string> = new Set<string>([
   // ── Creating new agents / sandboxes (operator runs ONE agent locally) ──
@@ -99,7 +99,7 @@ export const SIM_DENIED_TOOLS: ReadonlySet<string> = new Set<string>([
   //    code" track invited. Removing the code/build surface makes that impulse
   //    impossible to act on. The agent keeps: trading tools, memory/journaling
   //    (read_file, write_file, remember_fact, save_procedure...), and
-  //    operational tools (sleep, check_credits, view_soul, ...).
+  //    operational tools (sleep, view_soul, ...).
   "exec",
   "edit_own_file",
   "revert_last_edit",
@@ -116,6 +116,19 @@ export const SIM_DENIED_TOOLS: ReadonlySet<string> = new Set<string>([
   "install_skill",
   "modify_heartbeat",
   "update_genesis_prompt",
+
+  // ── Compute-budget introspection: the sim ledger (inference credits) is the
+  //    OPERATOR's concern, not a trading input — it buys tokens, not coins.
+  //    Exposing it made the agent conflate the two: it repeatedly stored facts
+  //    like "available_credits $5.00" and wrote procedures that waited for
+  //    "credits to reach $10" before buying, while $3,790 of trading cash sat
+  //    idle. The numbers also go stale within the hour and then mislead.
+  //    check_usdc_balance goes for the same reason (always 0 here, and USDC is
+  //    not the paper-trading currency). The heartbeat's own credit check is
+  //    unaffected — it reads ctx.creditBalance directly, not this tool — so
+  //    low-credit wake/escalation behaviour still works.
+  "check_credits",
+  "check_usdc_balance",
 ]);
 
 /**
