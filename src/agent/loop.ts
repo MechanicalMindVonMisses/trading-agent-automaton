@@ -67,7 +67,11 @@ import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
 import { filterToolsForSim, isSimMode } from "./sim-restrictions.js";
 import { setAvailableToolNames } from "./available-tools.js";
-import { createTradingTools } from "./trading-tools.js";
+import {
+  createTradingTools,
+  getActiveSellSignals,
+  formatSellSignal,
+} from "./trading-tools.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -481,6 +485,41 @@ export async function runAgentLoop(
         }
       }
 
+      // ── Forced decision turn (sim) ──
+      // With a free choice of tools, an agent looking at an explicit STOP LOSS
+      // can always call a read-only tool instead and let the signal stand —
+      // which is exactly what it did, for eleven turns, until the idle detector
+      // put it to sleep. Not deciding is not the same as deciding to hold.
+      // While a signal is live the turn is narrowed to exactly two moves,
+      // sell_crypto or hold_position, so the agent still makes the call but
+      // cannot decline to make one.
+      let forcedDecisionTools: AutomatonTool[] | undefined;
+      if (isSimMode()) {
+        const signals = await getActiveSellSignals();
+        if (signals.length > 0) {
+          forcedDecisionTools = tools.filter((t) =>
+            ["sell_crypto", "close_short", "hold_position"].includes(t.name),
+          );
+          const lines = signals.map((s) => `  ! ${formatSellSignal(s)}`);
+          pendingInput = {
+            content:
+              `DECISION REQUIRED. These positions have reached the exit levels YOU set:\n` +
+              `${lines.join("\n")}\n\n` +
+              `Close it (sell_crypto for a long, close_short for a short), or keep it with ` +
+              `hold_position — which requires a reason and new levels, because holding ` +
+              `through your own stop means moving it on the record. Those are your only ` +
+              `options this turn; checking the price again is not one of them.`,
+            source: "self",
+          };
+          log(
+            config,
+            `[DECISION] ${signals.length} live sell signal(s): ${signals
+              .map((s) => `${s.symbol} ${s.kind}`)
+              .join(", ")}. Forcing a decision turn.`,
+          );
+        }
+      }
+
       // Refresh financial state periodically
       financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
 
@@ -655,7 +694,7 @@ export async function runAgentLoop(
       const survivalTier = getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
-      const inferenceTools = toolsToInferenceFormat(tools);
+      const inferenceTools = toolsToInferenceFormat(forcedDecisionTools ?? tools);
       const routerResult = await inferenceRouter.route(
         {
           messages: messages,
@@ -903,6 +942,11 @@ export async function runAgentLoop(
         "update_soul", "remember_fact", "set_goal", "complete_goal",
         "save_procedure", "note_about_agent", "forget",
         "enter_low_compute", "switch_model", "review_upstream_changes",
+        // Sim trading. Without these the agent's entire job counted as idle:
+        // a turn that executed a trade still incremented idleTurnCount and
+        // pushed it toward a forced sleep. hold_position counts too — it is a
+        // recorded decision, not a dodge.
+        "buy_crypto", "sell_crypto", "open_short", "close_short", "hold_position",
       ]);
       const didMutate = turn.toolCalls.some((tc) => MUTATING_TOOLS.has(tc.name));
 
