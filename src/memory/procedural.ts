@@ -8,8 +8,16 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { ulid } from "ulid";
 import type { ProceduralMemoryEntry, ProceduralStep } from "../types.js";
+import { buildTermScore, tokenizeQuery } from "./query-tokens.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("memory.procedural");
+
+/**
+ * Cap on rows a search returns. A term-scored search over a long injected
+ * prompt matches far more rows than a whole-string LIKE ever did; the budget
+ * manager trims further, but an unbounded result would build the block first.
+ */
+const SEARCH_LIMIT = 10;
 
 type Database = BetterSqlite3.Database;
 
@@ -80,14 +88,31 @@ export class ProceduralMemoryManager {
    */
   search(query: string): ProceduralMemoryEntry[] {
     try {
-      // Escape SQL LIKE wildcards so literal '%' and '_' in the query
-      // don't match arbitrary characters.
+      // A short, deliberate query is still matched as one literal substring:
+      // that is what recall_procedure passes, and it keeps '%' and '_' literal
+      // instead of letting them act as wildcards or term separators.
       const escaped = query.replace(/[%_]/g, (ch) => `\\${ch}`);
-      const rows = this.db.prepare(
+      const exact = this.db.prepare(
         `SELECT * FROM procedural_memory
          WHERE name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\'
          ORDER BY success_count DESC, updated_at DESC`,
       ).all(`%${escaped}%`, `%${escaped}%`) as any[];
+      if (exact.length > 0) return exact.map(deserializeProcedural);
+
+      // Nothing holds the query verbatim — the normal case for the retriever,
+      // whose query is the whole injected turn input. Fall back to scoring
+      // rows by how many distinct query terms they match. See query-tokens.ts.
+      const terms = tokenizeQuery(query);
+      if (terms.length === 0) return [];
+      const { sql, params } = buildTermScore(terms, ["name", "description"]);
+      const rows = this.db.prepare(
+        `SELECT * FROM (
+           SELECT *, (${sql}) AS match_score FROM procedural_memory
+         )
+         WHERE match_score > 0
+         ORDER BY match_score DESC, success_count DESC, updated_at DESC
+         LIMIT ${SEARCH_LIMIT}`,
+      ).all(...params) as any[];
       return rows.map(deserializeProcedural);
     } catch (error) {
       logger.error("Failed to search", error instanceof Error ? error : undefined);

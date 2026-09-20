@@ -9,8 +9,12 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { ulid } from "ulid";
 import type { SemanticMemoryEntry, SemanticCategory } from "../types.js";
+import { buildTermScore, tokenizeQuery } from "./query-tokens.js";
 import { createLogger } from "../observability/logger.js";
 const logger = createLogger("memory.semantic");
+
+/** Cap on rows a term-scored search returns; the budget manager trims further. */
+const SEARCH_LIMIT = 10;
 
 type Database = BetterSqlite3.Database;
 
@@ -82,22 +86,49 @@ export class SemanticMemoryManager {
    */
   search(query: string, category?: SemanticCategory): SemanticMemoryEntry[] {
     try {
-      // Escape SQL LIKE wildcards so literal '%' and '_' in the query
-      // don't match arbitrary characters.
+      // A short, deliberate query is still matched as one literal substring,
+      // keeping '%' and '_' literal instead of letting them act as wildcards
+      // or term separators.
       const escaped = query.replace(/[%_]/g, (ch) => `\\${ch}`);
+      const exact = category
+        ? this.db.prepare(
+            `SELECT * FROM semantic_memory
+             WHERE category = ? AND (key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')
+             ORDER BY confidence DESC, updated_at DESC`,
+          ).all(category, `%${escaped}%`, `%${escaped}%`) as any[]
+        : this.db.prepare(
+            `SELECT * FROM semantic_memory
+             WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\'
+             ORDER BY confidence DESC, updated_at DESC`,
+          ).all(`%${escaped}%`, `%${escaped}%`) as any[];
+      if (exact.length > 0) return exact.map(deserializeSemantic);
+
+      // Nothing holds the query verbatim — the normal case for the retriever,
+      // whose query is the whole injected turn input. Fall back to scoring
+      // rows by how many distinct query terms they match. See query-tokens.ts.
+      const terms = tokenizeQuery(query);
+      if (terms.length === 0) return [];
+      const { sql, params } = buildTermScore(terms, ["key", "value"]);
       if (category) {
         const rows = this.db.prepare(
-          `SELECT * FROM semantic_memory
-           WHERE category = ? AND (key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')
-           ORDER BY confidence DESC, updated_at DESC`,
-        ).all(category, `%${escaped}%`, `%${escaped}%`) as any[];
+          `SELECT * FROM (
+             SELECT *, (${sql}) AS match_score FROM semantic_memory
+             WHERE category = ?
+           )
+           WHERE match_score > 0
+           ORDER BY match_score DESC, confidence DESC, updated_at DESC
+           LIMIT ${SEARCH_LIMIT}`,
+        ).all(...params, category) as any[];
         return rows.map(deserializeSemantic);
       }
       const rows = this.db.prepare(
-        `SELECT * FROM semantic_memory
-         WHERE key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\'
-         ORDER BY confidence DESC, updated_at DESC`,
-      ).all(`%${escaped}%`, `%${escaped}%`) as any[];
+        `SELECT * FROM (
+           SELECT *, (${sql}) AS match_score FROM semantic_memory
+         )
+         WHERE match_score > 0
+         ORDER BY match_score DESC, confidence DESC, updated_at DESC
+         LIMIT ${SEARCH_LIMIT}`,
+      ).all(...params) as any[];
       return rows.map(deserializeSemantic);
     } catch (error) {
       logger.error("Failed to search", error instanceof Error ? error : undefined);
