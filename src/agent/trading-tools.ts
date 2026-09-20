@@ -34,11 +34,16 @@ const MIN_TRADE_USD = 10;
 // losses. These thresholds turn portfolio_status into an explicit sell-signal
 // feed, and buy_crypto enforces a cash reserve + per-coin concentration cap so
 // the agent cannot deploy everything into one endless long.
-const TAKE_PROFIT_PCT = 5; // flag SELL when a position is up >= this %
-const STOP_LOSS_PCT = 4; // flag SELL when a position is down >= this %
+// Thresholds are deliberately tight. At +5%/-4% the agent ran for a full day
+// without a single signal firing — BTC/ETH simply never moved that far — so the
+// sell discipline was never exercised and we learned nothing about whether the
+// model obeys it. At +-2% signals fire on ordinary intraday moves, which is the
+// point: this is a behavioural experiment, not a strategy tuned for returns.
+const TAKE_PROFIT_PCT = 2; // flag SELL when a position is up >= this %
+const STOP_LOSS_PCT = 2; // flag SELL when a position is down >= this %
 const MIN_CASH_RESERVE_PCT = 20; // never let a buy push cash below this % of equity
 const MAX_POSITION_PCT = 45; // no single coin may exceed this % of equity
-const NO_AVERAGE_DOWN_PCT = 2; // block adding to a position already down more than this %
+const NO_AVERAGE_DOWN_PCT = 1; // block adding to a position already down more than this %
 
 // ─── Portfolio Ledger ──────────────────────────────────────────
 
@@ -96,6 +101,43 @@ function savePortfolio(portfolio: Portfolio): void {
   const tmp = file + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(portfolio, null, 2), "utf-8");
   fs.renameSync(tmp, file);
+}
+
+// ─── Trade Journal (WORKLOG.md) ────────────────────────────────
+// The prompt tells the agent to journal with write_file, but write_file
+// resolves paths against the sandbox root ("/root") while the prompt loads the
+// journal from the automaton state dir — so anything it wrote could never be
+// read back. In ~800 turns it never called write_file once anyway. Trades are
+// appended here instead, to the exact path the prompt reads, so the agent's own
+// stated reasons come back to it on the next turn.
+//
+// The loader injects the whole file with no truncation, so the journal is
+// trimmed to the most recent entries to keep it (and the token bill) bounded.
+const WORKLOG_MAX_ENTRIES = 30;
+
+function appendWorklog(entry: string): void {
+  try {
+    const file = nodePath.join(getAutomatonDir(), "WORKLOG.md");
+    const header = `# Trade Journal
+
+Appended automatically on every executed trade.
+
+`;
+    const existing = fs.existsSync(file)
+      ? fs.readFileSync(file, "utf-8")
+      : header;
+    const entries = existing
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith("- "));
+    entries.push(entry);
+    const kept = entries.slice(-WORKLOG_MAX_ENTRIES);
+    fs.writeFileSync(file, header + kept.join("\n") + "\n", "utf-8");
+  } catch (err) {
+    logger.error(
+      "WORKLOG append failed",
+      err instanceof Error ? err : undefined,
+    );
+  }
 }
 
 // ─── Price Feed (CoinGecko) ────────────────────────────────────
@@ -299,6 +341,10 @@ export function createTradingTools(): AutomatonTool[] {
         logger.info(
           `BUY ${symbol}: $${fmtUsd(usdAmount)} @ $${fmtUsd(price)}`,
         );
+        appendWorklog(
+          `- ${new Date().toISOString()} **BUY ${symbol}** $${fmtUsd(usdAmount)} @ $${fmtUsd(price)} — ` +
+            `thesis: ${String(args.reason ?? "").trim() || "(none given)"}`,
+        );
 
         return (
           `Bought ${fmtAmount(amount)} ${symbol} @ $${fmtUsd(price)} for $${fmtUsd(usdAmount)} (paper trade).\n` +
@@ -386,6 +432,11 @@ export function createTradingTools(): AutomatonTool[] {
         savePortfolio(portfolio);
         logger.info(
           `SELL ${symbol}: $${fmtUsd(sellValueUsd)} @ $${fmtUsd(price)} (P&L $${fmtUsd(realizedPnlUsd)})`,
+        );
+        appendWorklog(
+          `- ${new Date().toISOString()} **SELL ${symbol}** $${fmtUsd(sellValueUsd)} @ $${fmtUsd(price)}, ` +
+            `realized ${realizedPnlUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(realizedPnlUsd))} — ` +
+            `reason: ${String(args.reason ?? "").trim() || "(none given)"}`,
         );
 
         const pnlSign = realizedPnlUsd >= 0 ? "+" : "-";

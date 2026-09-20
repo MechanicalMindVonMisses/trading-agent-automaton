@@ -22,6 +22,7 @@ import type {
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
+import { getAvailableToolNames } from "./available-tools.js";
 
 const logger = createLogger("tools");
 
@@ -2610,6 +2611,41 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["name", "description", "steps"],
       },
       execute: async (args, ctx) => {
+        // Reject procedures whose steps call tools that do not exist here.
+        // The model invents plausible-sounding tools ("pip", "nano", "vercel",
+        // "x402_fetch"), and recall_procedure later serves those steps back as
+        // if they were runnable. Catching it at write time keeps the store
+        // executable instead of requiring periodic cleanup passes.
+        const available = getAvailableToolNames();
+        if (available.size > 0) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(args.steps as string);
+          } catch {
+            parsed = null;
+          }
+          if (Array.isArray(parsed)) {
+            const referenced = parsed
+              .map((step) =>
+                step && typeof step === "object"
+                  ? (step as { tool?: unknown }).tool
+                  : undefined,
+              )
+              .filter((t): t is string => typeof t === "string" && t.length > 0);
+            const unknown = [...new Set(referenced)].filter(
+              (t) => !available.has(t),
+            );
+            if (unknown.length > 0) {
+              return (
+                `Rejected: these steps reference tools you do not have: ${unknown.join(", ")}. ` +
+                `A procedure is only useful if every step names a real tool. Your tools are: ` +
+                `${[...available].sort().join(", ")}. ` +
+                `Rewrite the procedure using those, or leave "tool" null for a step you do by reasoning.`
+              );
+            }
+          }
+        }
+
         const { saveProcedure } = await import("../memory/tools.js");
         return saveProcedure(ctx.db.raw, {
           name: args.name as string,

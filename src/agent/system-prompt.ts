@@ -553,14 +553,16 @@ with your $10,000 fake-USD portfolio. The loop, every turn:
   3. Act on it: buy_crypto / sell_crypto, always stating the thesis in "reason".
      Or deliberately HOLD — that is a legitimate decision, not a wasted turn.
   4. Review: portfolio_status for P&L AND for ">>> SELL SIGNALS". When a position
-     is flagged (up +5% take-profit, or down -4% stop-loss), SELL it that turn.
+     is flagged (up +2% take-profit, or down -2% stop-loss), SELL it that turn.
      Do not become a buy-and-hold-forever machine: profit is only real once sold.
-  5. Record: write your thesis, decision, and outcome to WORKLOG.md and to
-     memory (remember_fact) so your strategy compounds over time.
+  5. Record: state a real thesis in every buy_crypto / sell_crypto "reason" —
+     each executed trade is appended to WORKLOG.md automatically, so that text
+     is what you will read back next turn. Use remember_fact for what you
+     learned, so your strategy compounds over time.
 
 Discipline the tools enforce: keep >=20% of equity in cash, no single coin over
 ~45% of equity, and NO averaging down (buy_crypto refuses to add to a position
-already down >2%). If buy_crypto blocks you, the answer is to SELL something
+already down >1%). If buy_crypto blocks you, the answer is to SELL something
 (take profit / cut a loss) or hold — not to keep trying to buy. A losing
 position must recover on its own or be cut; do not feed it more cash.
 
@@ -765,8 +767,14 @@ Your chain type is ${chainType}.`,
   // Layer 3.5: WORKLOG.md -- persistent working context
   const worklogContent = loadWorklog();
   if (worklogContent) {
+    // In sim mode the journal is written by the trading tools, not by the
+    // agent: write_file resolves against the sandbox root while this loader
+    // reads the state dir, so telling it to "update WORKLOG.md using
+    // write_file" pointed at a file that could never be read back.
     sections.push(
-      `--- WORKLOG.md (your persistent working context — UPDATE THIS after each task!) ---\n${worklogContent}\n--- END WORKLOG.md ---\n\nIMPORTANT: After completing any task or making any decision, update WORKLOG.md using write_file.\nThis is how you remember what you were doing across turns. Without it, you lose context and repeat yourself.`,
+      simMode
+        ? `--- WORKLOG.md (your trade journal — appended automatically on every executed trade) ---\n${worklogContent}\n--- END WORKLOG.md ---\n\nThis is your own record of what you did and why. Read it before trading again: it is how you avoid repeating a thesis that already failed.`
+        : `--- WORKLOG.md (your persistent working context — UPDATE THIS after each task!) ---\n${worklogContent}\n--- END WORKLOG.md ---\n\nIMPORTANT: After completing any task or making any decision, update WORKLOG.md using write_file.\nThis is how you remember what you were doing across turns. Without it, you lose context and repeat yourself.`,
     );
   }
 

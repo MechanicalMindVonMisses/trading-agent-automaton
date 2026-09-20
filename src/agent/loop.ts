@@ -66,6 +66,7 @@ import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
 import { filterToolsForSim, isSimMode } from "./sim-restrictions.js";
+import { setAvailableToolNames } from "./available-tools.js";
 import { createTradingTools } from "./trading-tools.js";
 
 const logger = createLogger("loop");
@@ -124,6 +125,9 @@ export async function runAgentLoop(
     ...tradingTools,
     ...installedTools,
   ]);
+  // Publish the final tool list so tools that need to reason about what else
+  // exists (save_procedure validating its steps) can see it.
+  setAvailableToolNames(tools.map((t) => t.name));
   const toolContext: ToolContext = {
     identity,
     config,
