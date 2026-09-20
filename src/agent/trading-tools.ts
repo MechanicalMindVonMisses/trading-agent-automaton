@@ -81,6 +81,11 @@ interface TradeRecord {
   valueUsd: number;
   reason: string;
   /**
+   * The checked ground the agent filed an entry under: falling_24h,
+   * rising_24h, rebalance or thesis (opening trades only).
+   */
+  signal?: string;
+  /**
    * The checked label the agent put on a close: take_profit, stop_loss,
    * thesis_change or risk (closing trades only). Recorded so the mix can be
    * read back — a run that is all thesis_change at a loss reads very
@@ -509,6 +514,69 @@ function fmtPct(n: number): string {
  */
 export const EXIT_TYPES = ["take_profit", "stop_loss", "thesis_change", "risk"] as const;
 
+/**
+ * The grounds an agent may file an entry under, two of which the quote settles.
+ *
+ * The exit side was confabulating a trigger; the entry side confabulates a
+ * data source. The agent bought ETH citing "RSI (14) oversold conditions" and
+ * "trading below its 200-day moving average", and BTC on "upcoming ETF
+ * approvals" — it has no indicator feed, no chart history and no news. Its
+ * entire input is a spot price, a 24h change and a 24h volume.
+ *
+ * An entry thesis cannot be checked the way an exit claim can: there is no
+ * number that settles "ETH will rebound". What can be checked is the ground
+ * the agent says it is standing on. falling_24h and rising_24h are assertions
+ * about the quote in front of it, so the quote settles them. rebalance and
+ * thesis are judgements, accepted at any price.
+ *
+ * This does not stop the prose from inventing an indicator — free text stays
+ * free. It does mean an entry has to name a ground, that two of the four
+ * grounds are checked, and that an entry resting on nothing observable has to
+ * be filed as `thesis`, which is the honest word for it. The mix is then
+ * readable: an agent whose every buy is `thesis` is telling you its numbers
+ * are decoration.
+ */
+const ENTRY_SIGNALS = ["falling_24h", "rising_24h", "rebalance", "thesis"] as const;
+
+/** Reject an entry ground the quote contradicts. Returns null when it holds. */
+export function checkEntrySignal(
+  symbol: string,
+  change24hPct: number,
+  rawSignal: unknown,
+): string | null {
+  const signal = String(rawSignal ?? "").trim().toLowerCase();
+  if (!(ENTRY_SIGNALS as readonly string[]).includes(signal)) {
+    return (
+      `signal must be one of: ${ENTRY_SIGNALS.join(", ")}. ` +
+      `falling_24h and rising_24h are claims about the quote and are checked against it; ` +
+      `rebalance and thesis are your judgement and are always accepted.`
+    );
+  }
+
+  const observed = `${symbol} is ${fmtPct(change24hPct)} over 24h`;
+  const inputs =
+    `Your only market inputs are the spot price, the 24h change and the 24h volume — ` +
+    `no indicators, no chart history, no news.`;
+
+  if (signal === "falling_24h" && change24hPct >= 0) {
+    return (
+      `You filed this under falling_24h, but ${observed}. ${inputs}\n` +
+      `File it under rising_24h, rebalance if this is about deploying cash rather than a ` +
+      `view on ${symbol}, or thesis if your reason does not rest on the quote at all.`
+    );
+  }
+
+  if (signal === "rising_24h" && change24hPct <= 0) {
+    return (
+      `You filed this under rising_24h, but ${observed}. ${inputs}\n` +
+      `File it under falling_24h, rebalance if this is about deploying cash rather than a ` +
+      `view on ${symbol}, or thesis if your reason does not rest on the quote at all.`
+    );
+  }
+
+  return null;
+}
+
 /** Reject an exit label the position contradicts. Returns null when it holds. */
 export function checkExitClaim(
   symbol: string,
@@ -608,6 +676,15 @@ export function createTradingTools(): AutomatonTool[] {
             type: "number",
             description: `USD amount to spend (min $${MIN_TRADE_USD})`,
           },
+          signal: {
+            type: "string",
+            enum: [...ENTRY_SIGNALS],
+            description:
+              "What this entry rests on. falling_24h and rising_24h are claims about the " +
+              "quote and are checked against it. rebalance (deploying cash, not a view) and " +
+              "thesis (a view the quote does not show) are your judgement and are always " +
+              "accepted. Your only market inputs are spot price, 24h change and 24h volume.",
+          },
           reason: {
             type: "string",
             description: "Your trading thesis: why this is a buy right now",
@@ -625,6 +702,7 @@ export function createTradingTools(): AutomatonTool[] {
           "symbol",
           "usd_amount",
           "reason",
+          "signal",
           "take_profit_pct",
           "stop_loss_pct",
         ],
@@ -653,6 +731,16 @@ export function createTradingTools(): AutomatonTool[] {
         const quotes = await fetchQuotes();
         const price = quotes[symbol].usd;
         const amount = usdAmount / price;
+
+        // Settle the stated ground before anything else: an entry filed under
+        // the quote has to match the quote.
+        const signalError = checkEntrySignal(
+          symbol,
+          quotes[symbol].change24hPct,
+          args.signal,
+        );
+        if (signalError) return signalError;
+        const signal = String(args.signal).trim().toLowerCase();
 
         const existing = portfolio.positions[symbol];
         if (existing && existing.side === "short") {
@@ -726,14 +814,15 @@ export function createTradingTools(): AutomatonTool[] {
           priceUsd: price,
           valueUsd: usdAmount,
           reason: String(args.reason ?? ""),
+          signal,
         });
         savePortfolio(portfolio);
         logger.info(
-          `BUY ${symbol}: $${fmtUsd(usdAmount)} @ $${fmtUsd(price)}`,
+          `BUY ${symbol}: $${fmtUsd(usdAmount)} @ $${fmtUsd(price)} (${signal})`,
         );
         appendWorklog(
           `- ${new Date().toISOString()} **BUY ${symbol}** $${fmtUsd(usdAmount)} @ $${fmtUsd(price)} ` +
-            `(TP +${takeProfitPct}% / SL -${stopLossPct}%) — ` +
+            `(TP +${takeProfitPct}% / SL -${stopLossPct}%) [${signal}] — ` +
             `thesis: ${String(args.reason ?? "").trim() || "(none given)"}`,
         );
 
@@ -892,6 +981,15 @@ export function createTradingTools(): AutomatonTool[] {
             type: "number",
             description: `USD notional to short, locked as collateral (min $${MIN_TRADE_USD})`,
           },
+          signal: {
+            type: "string",
+            enum: [...ENTRY_SIGNALS],
+            description:
+              "What this entry rests on. falling_24h and rising_24h are claims about the " +
+              "quote and are checked against it. rebalance (positioning, not a view) and " +
+              "thesis (a view the quote does not show) are your judgement and are always " +
+              "accepted. Your only market inputs are spot price, 24h change and 24h volume.",
+          },
           reason: {
             type: "string",
             description: "Your bearish thesis: why this coin falls from here",
@@ -909,6 +1007,7 @@ export function createTradingTools(): AutomatonTool[] {
           "symbol",
           "usd_amount",
           "reason",
+          "signal",
           "take_profit_pct",
           "stop_loss_pct",
         ],
@@ -942,6 +1041,16 @@ export function createTradingTools(): AutomatonTool[] {
         const quotes = await fetchQuotes();
         const price = quotes[symbol].usd;
         const amount = usdAmount / price;
+
+        // Same check as buy_crypto: the labels describe the quote, not a
+        // direction, so shorting into a fall is still falling_24h.
+        const signalError = checkEntrySignal(
+          symbol,
+          quotes[symbol].change24hPct,
+          args.signal,
+        );
+        if (signalError) return signalError;
+        const signal = String(args.signal).trim().toLowerCase();
 
         if (existing && existing.avgCostUsd > 0) {
           const posPnlPct = positionPnl(existing, price).pnlPct;
@@ -999,12 +1108,15 @@ export function createTradingTools(): AutomatonTool[] {
           priceUsd: price,
           valueUsd: usdAmount,
           reason: String(args.reason ?? ""),
+          signal,
         });
         savePortfolio(portfolio);
-        logger.info(`SHORT ${symbol}: $${fmtUsd(usdAmount)} @ $${fmtUsd(price)}`);
+        logger.info(
+          `SHORT ${symbol}: $${fmtUsd(usdAmount)} @ $${fmtUsd(price)} (${signal})`,
+        );
         appendWorklog(
           `- ${new Date().toISOString()} **SHORT ${symbol}** $${fmtUsd(usdAmount)} @ $${fmtUsd(price)} ` +
-            `(TP -${takeProfitPct}% / SL +${stopLossPct}%) — ` +
+            `(TP -${takeProfitPct}% / SL +${stopLossPct}%) [${signal}] — ` +
             `thesis: ${String(args.reason ?? "").trim() || "(none given)"}`,
         );
 

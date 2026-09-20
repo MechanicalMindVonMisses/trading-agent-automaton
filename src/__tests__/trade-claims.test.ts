@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EXIT_TYPES, checkExitClaim } from "../agent/trading-tools.js";
+import { EXIT_TYPES, checkEntrySignal, checkExitClaim } from "../agent/trading-tools.js";
 
 /**
  * Positions shaped like the ones the agent actually held when it closed them
@@ -121,7 +121,7 @@ describe("checkExitClaim", () => {
     ).toBeTruthy();
   });
 
-  it("checks a short against its own direction", () => {
+  it("checks a short's exit against its own direction", () => {
     // positionPnl already signs a short's P&L, so a cover at a loss arrives
     // here negative and must fail the same way a long does.
     const short = {
@@ -134,5 +134,49 @@ describe("checkExitClaim", () => {
     };
     expect(checkExitClaim("SOL", short, -3, "take_profit")).toBeTruthy();
     expect(checkExitClaim("SOL", short, 12, "take_profit")).toBeNull();
+  });
+});
+
+describe("checkEntrySignal", () => {
+  it("rejects falling_24h when the coin is up", () => {
+    const err = checkEntrySignal("ETH", 3.2, "falling_24h");
+    expect(err).toBeTruthy();
+    expect(err).toContain("+3.20%");
+  });
+
+  it("rejects rising_24h when the coin is down", () => {
+    // The real call: ETH bought while -2.21% over 24h, on "institutional
+    // buying pressure" and an RSI reading the agent cannot see.
+    const err = checkEntrySignal("ETH", -2.21, "rising_24h");
+    expect(err).toBeTruthy();
+    expect(err).toContain("-2.21%");
+  });
+
+  it("accepts a ground the quote supports", () => {
+    expect(checkEntrySignal("ETH", -2.21, "falling_24h")).toBeNull();
+    expect(checkEntrySignal("BTC", 1.4, "rising_24h")).toBeNull();
+  });
+
+  it("treats a flat quote as supporting neither direction", () => {
+    expect(checkEntrySignal("SOL", 0, "falling_24h")).toBeTruthy();
+    expect(checkEntrySignal("SOL", 0, "rising_24h")).toBeTruthy();
+  });
+
+  it("accepts a judgement ground at any quote", () => {
+    for (const change of [-9, -2.21, 0, 1.4, 12]) {
+      expect(checkEntrySignal("ETH", change, "rebalance")).toBeNull();
+      expect(checkEntrySignal("ETH", change, "thesis")).toBeNull();
+    }
+  });
+
+  it("tells the agent what its actual inputs are when it refuses", () => {
+    const err = checkEntrySignal("ETH", -2.21, "rising_24h");
+    expect(err).toContain("24h change");
+    expect(err).toContain("no indicators");
+  });
+
+  it("rejects an unknown or missing ground", () => {
+    expect(checkEntrySignal("ETH", -2.21, "rsi_oversold")).toBeTruthy();
+    expect(checkEntrySignal("ETH", -2.21, undefined)).toBeTruthy();
   });
 });
