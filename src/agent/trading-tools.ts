@@ -179,6 +179,52 @@ function computeEquity(
   return equity;
 }
 
+/**
+ * Describe the last time this symbol was closed, for the refusal message when
+ * the agent tries to close it again.
+ *
+ * It did exactly that four turns running: after selling ETH on its stop it
+ * called sell_crypto three more times, each with the signal's numbers rather
+ * than the fill's, and the loop detector's "stop repeating yourself" injection
+ * did not break it. "No ETH position to sell" says what is missing but not why,
+ * so the intent that produced the call still looks unfinished. Telling it what
+ * it already did, at the moment it tries to redo it, puts the fact where the
+ * decision is being made instead of in a journal it is not consulting.
+ */
+function describeRecentClose(
+  portfolio: Portfolio,
+  symbol: string,
+): string | null {
+  const close = [...portfolio.trades]
+    .reverse()
+    .find(
+      (t) =>
+        t.symbol === symbol && (t.side === "sell" || t.side === "cover"),
+    );
+  if (!close) return null;
+
+  const minutesAgo = Math.max(
+    0,
+    Math.round((Date.now() - new Date(close.time).getTime()) / 60_000),
+  );
+  const when =
+    minutesAgo < 90
+      ? `${minutesAgo} minute${minutesAgo === 1 ? "" : "s"} ago`
+      : `at ${close.time.slice(11, 16)} UTC`;
+  const verb = close.side === "sell" ? "sold" : "covered";
+  const pnl = close.realizedPnlUsd;
+  const pnlNote =
+    pnl === undefined
+      ? ""
+      : `, realizing ${pnl >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(pnl))}`;
+
+  return (
+    `You already closed this position ${when}: ${verb} ${fmtAmount(close.amount)} ${symbol} ` +
+    `@ $${fmtUsd(close.priceUsd)}${pnlNote}. That trade is done — the level you are reacting to ` +
+    `has already been acted on. Stop re-closing it and pick your next move.`
+  );
+}
+
 /** Reject a declared exit level that is missing or outside sane bounds. */
 function validateExitLevel(value: unknown, label: string): string | null {
   const pct = Number(value);
@@ -656,9 +702,12 @@ export function createTradingTools(): AutomatonTool[] {
         const portfolio = loadPortfolio();
         const pos = portfolio.positions[symbol];
         if (!pos || pos.amount <= 0) {
-          return `No ${symbol} position to sell. Current positions: ${
-            Object.keys(portfolio.positions).join(", ") || "(none)"
-          }`;
+          const open =
+            Object.keys(portfolio.positions).join(", ") || "(none — all cash)";
+          const recent = describeRecentClose(portfolio, symbol);
+          return recent
+            ? `${recent}\nYour open positions: ${open}. Cash: $${fmtUsd(portfolio.cashUsd)}.`
+            : `No ${symbol} position to sell. Current positions: ${open}`;
         }
         if (pos.side === "short") {
           return `Your ${symbol} position is a SHORT — you do not own coins to sell. Use close_short to buy it back and realize the result.`;
@@ -896,9 +945,12 @@ export function createTradingTools(): AutomatonTool[] {
         const portfolio = loadPortfolio();
         const pos = portfolio.positions[symbol];
         if (!pos || pos.amount <= 0) {
-          return `No ${symbol} position to close. Current positions: ${
-            Object.keys(portfolio.positions).join(", ") || "(none)"
-          }`;
+          const open =
+            Object.keys(portfolio.positions).join(", ") || "(none — all cash)";
+          const recent = describeRecentClose(portfolio, symbol);
+          return recent
+            ? `${recent}\nYour open positions: ${open}. Cash: $${fmtUsd(portfolio.cashUsd)}.`
+            : `No ${symbol} position to close. Current positions: ${open}`;
         }
         if (pos.side !== "short") {
           return `Your ${symbol} position is a LONG, not a short. Use sell_crypto to close it.`;
