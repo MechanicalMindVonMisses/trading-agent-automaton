@@ -29,6 +29,17 @@ const SYMBOLS = Object.keys(COINS);
 const INITIAL_CAPITAL_USD = 10_000;
 const MIN_TRADE_USD = 10;
 
+// ─── Sell Discipline ───────────────────────────────────────────
+// The agent tends to buy-and-accumulate forever and never take profit or cut
+// losses. These thresholds turn portfolio_status into an explicit sell-signal
+// feed, and buy_crypto enforces a cash reserve + per-coin concentration cap so
+// the agent cannot deploy everything into one endless long.
+const TAKE_PROFIT_PCT = 5; // flag SELL when a position is up >= this %
+const STOP_LOSS_PCT = 4; // flag SELL when a position is down >= this %
+const MIN_CASH_RESERVE_PCT = 20; // never let a buy push cash below this % of equity
+const MAX_POSITION_PCT = 45; // no single coin may exceed this % of equity
+const NO_AVERAGE_DOWN_PCT = 2; // block adding to a position already down more than this %
+
 // ─── Portfolio Ledger ──────────────────────────────────────────
 
 interface Position {
@@ -227,6 +238,45 @@ export function createTradingTools(): AutomatonTool[] {
         const price = quotes[symbol].usd;
         const amount = usdAmount / price;
 
+        // No averaging down: refuse to add to a position that is already
+        // underwater beyond a small dip. Throwing more money at a loser keeps
+        // its %P&L near zero and dodges the stop-loss forever. Force the
+        // position to resolve (recover into take-profit, or hit stop-loss).
+        const existing = portfolio.positions[symbol];
+        if (existing && existing.avgCostUsd > 0) {
+          const posPnlPct = (price / existing.avgCostUsd - 1) * 100;
+          if (posPnlPct < -NO_AVERAGE_DOWN_PCT) {
+            return (
+              `Blocked: ${symbol} is already down ${Math.abs(posPnlPct).toFixed(2)}% on your position — do NOT average down into a loser. ` +
+              `Either hold and wait for it to recover toward take-profit, or cut it with sell_crypto if the thesis is broken. Adding more only digs the hole deeper.`
+            );
+          }
+        }
+
+        // Sell-discipline guards: keep a cash reserve and cap concentration so
+        // the agent can't deploy everything into one endless accumulation.
+        let equityUsd = portfolio.cashUsd;
+        for (const [s, p] of Object.entries(portfolio.positions)) {
+          equityUsd += p.amount * (quotes[s]?.usd ?? p.avgCostUsd);
+        }
+        const cashAfter = portfolio.cashUsd - usdAmount;
+        const reserveFloor = (equityUsd * MIN_CASH_RESERVE_PCT) / 100;
+        if (cashAfter < reserveFloor) {
+          return (
+            `Blocked: this buy would drop cash to $${fmtUsd(cashAfter)}, below your ${MIN_CASH_RESERVE_PCT}% reserve ($${fmtUsd(reserveFloor)}). ` +
+            `You are over-invested — take profit or cut a losing position (sell_crypto) before buying more. Check portfolio_status for SELL signals.`
+          );
+        }
+        const posValueAfter =
+          (portfolio.positions[symbol]?.amount ?? 0) * price + usdAmount;
+        const concentrationCap = (equityUsd * MAX_POSITION_PCT) / 100;
+        if (posValueAfter > concentrationCap) {
+          return (
+            `Blocked: this buy would make ${symbol} worth $${fmtUsd(posValueAfter)}, over your ${MAX_POSITION_PCT}% single-coin cap ($${fmtUsd(concentrationCap)}). ` +
+            `Diversify into another coin or trim ${symbol} first — do not pile everything into one position.`
+          );
+        }
+
         const pos = portfolio.positions[symbol];
         if (pos) {
           const totalCost = pos.avgCostUsd * pos.amount + usdAmount;
@@ -363,6 +413,7 @@ export function createTradingTools(): AutomatonTool[] {
         const lines: string[] = [];
 
         let positionsValueUsd = 0;
+        const sellSignals: string[] = [];
         const symbols = Object.keys(portfolio.positions);
         if (symbols.length > 0) {
           const quotes = await fetchQuotes();
@@ -383,6 +434,15 @@ export function createTradingTools(): AutomatonTool[] {
             lines.push(
               `  ${symbol}: ${fmtAmount(pos.amount)} @ avg $${fmtUsd(pos.avgCostUsd)} → $${fmtUsd(valueUsd)} (unrealized ${sign}$${fmtUsd(Math.abs(pnlUsd))}, ${sign}${Math.abs(pnlPct).toFixed(2)}%)`,
             );
+            if (pnlPct >= TAKE_PROFIT_PCT) {
+              sellSignals.push(
+                `TAKE PROFIT — ${symbol} is up ${pnlPct.toFixed(2)}% (+$${fmtUsd(pnlUsd)}). Consider sell_crypto to lock in the gain.`,
+              );
+            } else if (pnlPct <= -STOP_LOSS_PCT) {
+              sellSignals.push(
+                `STOP LOSS — ${symbol} is down ${Math.abs(pnlPct).toFixed(2)}% (-$${fmtUsd(Math.abs(pnlUsd))}). Consider sell_crypto to cut the loss.`,
+              );
+            }
           }
         } else {
           lines.push("Positions: (none — all cash)");
@@ -395,6 +455,15 @@ export function createTradingTools(): AutomatonTool[] {
         lines.push(
           `Total equity: $${fmtUsd(equityUsd)} (started $${fmtUsd(portfolio.initialCapitalUsd)}, ${totalSign}$${fmtUsd(Math.abs(totalPnlUsd))}, ${totalSign}${Math.abs((totalPnlUsd / portfolio.initialCapitalUsd) * 100).toFixed(2)}%)`,
         );
+
+        if (sellSignals.length > 0) {
+          lines.push(`>>> SELL SIGNALS (act on these now):`);
+          for (const sig of sellSignals) lines.push(`  ! ${sig}`);
+        } else if (symbols.length > 0) {
+          lines.push(
+            `No sell signals yet (take-profit +${TAKE_PROFIT_PCT}% / stop-loss -${STOP_LOSS_PCT}% not hit). Holding is fine.`,
+          );
+        }
 
         const recent = portfolio.trades.slice(-5);
         if (recent.length > 0) {

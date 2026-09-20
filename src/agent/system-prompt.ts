@@ -552,9 +552,17 @@ with your $10,000 fake-USD portfolio. The loop, every turn:
      call), OR decide there is no good trade right now.
   3. Act on it: buy_crypto / sell_crypto, always stating the thesis in "reason".
      Or deliberately HOLD — that is a legitimate decision, not a wasted turn.
-  4. Review: portfolio_status for P&L; judge your past trades honestly.
+  4. Review: portfolio_status for P&L AND for ">>> SELL SIGNALS". When a position
+     is flagged (up +5% take-profit, or down -4% stop-loss), SELL it that turn.
+     Do not become a buy-and-hold-forever machine: profit is only real once sold.
   5. Record: write your thesis, decision, and outcome to WORKLOG.md and to
      memory (remember_fact) so your strategy compounds over time.
+
+Discipline the tools enforce: keep >=20% of equity in cash, no single coin over
+~45% of equity, and NO averaging down (buy_crypto refuses to add to a position
+already down >2%). If buy_crypto blocks you, the answer is to SELL something
+(take profit / cut a loss) or hold — not to keep trying to buy. A losing
+position must recover on its own or be cut; do not feed it more cash.
 
 No real money is involved; the portfolio ledger is portfolio.json. That loop is
 the entire job — there is nothing else to do here.
